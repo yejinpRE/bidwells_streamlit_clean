@@ -1,14 +1,13 @@
-# app.py
-
 import streamlit as st
 import pandas as pd
+import numpy as np
+from sklearn.linear_model import LogisticRegression
 
 from engine1_text import (
     extract_text_from_pdf,
     engine1_run,
-    base_scores_from_text,  # used in repository tab
+    base_scores_from_text,  # used in repository tab if needed
 )
-
 from engine2_context import build_context_features
 from engine3_model import predict_approval_probability
 
@@ -23,7 +22,6 @@ st.set_page_config(
 st.title("Bayes ‘Plan Checker’ System – Prototype")
 st.caption("Engine 0–3 | Multi-document, context-aware planning risk engine")
 
-
 # ---------------------------------------------------------
 # Initialise session state
 # ---------------------------------------------------------
@@ -37,13 +35,13 @@ for key in [
     "ctx_features",
     "prediction",
     "repo_df",
+    "trained_model",
 ]:
     if key not in st.session_state:
         st.session_state[key] = None
 
-
 # ---------------------------------------------------------
-# Tabs for each Engine + Repository
+# Tabs
 # ---------------------------------------------------------
 tab_engine01, tab_engine2, tab_engine3, tab_repo = st.tabs(
     [
@@ -54,9 +52,8 @@ tab_engine01, tab_engine2, tab_engine3, tab_repo = st.tabs(
     ]
 )
 
-
 # =========================================================
-# TAB 1 – ENGINE 0 & 1: Documents (Rulebook + Extraction)
+# TAB 1 – ENGINE 0 & 1: Documents
 # =========================================================
 with tab_engine01:
     st.header("Engine 0 & 1 – Document analysis")
@@ -116,7 +113,6 @@ with tab_engine01:
 
             st.success("Engine 0 & 1 completed for this case.")
 
-    # Show results if available
     if st.session_state["doc_features"] is not None:
         st.subheader("Engine 0 & 1 – Outputs for this case")
 
@@ -151,9 +147,8 @@ with tab_engine01:
     else:
         st.info("Upload documents and click the button to run Engine 0 & 1.")
 
-
 # =========================================================
-# TAB 2 – ENGINE 2: Context (Sliders)
+# TAB 2 – ENGINE 2: Context
 # =========================================================
 with tab_engine2:
     st.header("Engine 2 – Context inputs")
@@ -235,9 +230,8 @@ with tab_engine2:
     else:
         st.info("Set and save context inputs to use Engine 2.")
 
-
 # =========================================================
-# TAB 3 – ENGINE 3: Output (Prediction)
+# TAB 3 – ENGINE 3: Output (Rule-based + Trained)
 # =========================================================
 with tab_engine3:
     st.header("Engine 3 – Predictive output")
@@ -252,6 +246,9 @@ with tab_engine3:
         
         …into a logit-style model to estimate the probability of planning approval and
         to show the contribution of each variable.
+
+        If a trained model exists from the Repository tab, Engine 3 will also show
+        the **data-driven probability** using those trained coefficients.
         """
     )
 
@@ -266,27 +263,30 @@ with tab_engine3:
             X_all.update(st.session_state["doc_features"])
             X_all.update(st.session_state["ctx_features"])
 
-            with st.spinner("Running Engine 3..."):
+            with st.spinner("Running Engine 3 (rule-based model)..."):
                 pred = predict_approval_probability(X_all)
 
-            st.session_state["prediction"] = pred
-            st.success("Engine 3 completed for this case.")
+            st.session_state["prediction"] = {
+                "rule_based": pred,
+                "X_all": X_all,
+            }
+            st.success("Engine 3 (rule-based) completed for this case.")
 
         if st.session_state["prediction"] is not None:
-            pred = st.session_state["prediction"]
+            pred = st.session_state["prediction"]["rule_based"]
+            X_all = st.session_state["prediction"]["X_all"]
             prob = pred["probability"]
             rating = pred["rating"]
 
-            st.subheader("Overall risk result")
+            st.subheader("Rule-based model result")
 
             col_main, col_side = st.columns([2, 1])
             with col_main:
                 st.metric(
-                    label="Predicted approval probability",
+                    label="Rule-based approval probability",
                     value=f"{prob*100:.1f}%",
                 )
                 st.write(f"**Risk rating:** {rating}")
-
                 st.progress(min(max(prob, 0.01), 0.99))
 
             with col_side:
@@ -294,7 +294,7 @@ with tab_engine3:
                 st.write(f"{pred['linear_score']:.3f}")
 
             st.markdown("---")
-            st.markdown("### Coefficients & contributions")
+            st.markdown("### Rule-based coefficients & contributions")
 
             contrib_rows = pred.get("contributions", [])
             if contrib_rows:
@@ -303,43 +303,91 @@ with tab_engine3:
                     by="abs_contribution", ascending=False
                 )
 
-                st.write("Top drivers (by absolute contribution to Z_total):")
+                st.write("Top drivers (rule-based, by |β × X|):")
                 st.dataframe(
-                    df_contrib.head(12)[
+                    df_contrib.head(10)[
                         ["name", "type", "value", "coefficient", "contribution"]
                     ]
                 )
 
-                with st.expander("Show all variables and contributions"):
+                with st.expander("Show all variables and contributions (rule-based)"):
                     st.dataframe(
                         df_contrib[
                             ["name", "type", "value", "coefficient", "contribution"]
                         ]
                     )
 
+            # ---- If a trained model exists, show its prediction as well ----
+            if st.session_state.get("trained_model") is not None:
+                st.markdown("---")
+                st.markdown("### Trained regression result (document-only model)")
+
+                tm = st.session_state["trained_model"]
+                feature_names = tm.get("feature_names", [])
+                coef = np.array(tm.get("coef", []), dtype=float)
+                intercept = float(tm.get("intercept", 0.0))
+
+                # Build feature vector in the same order
+                x_vec = []
+                for name in feature_names:
+                    x_vec.append(float(X_all.get(name, 0.0)))
+                x_vec = np.array(x_vec)
+
+                z_trained = intercept + np.dot(coef, x_vec)
+                prob_trained = 1.0 / (1.0 + np.exp(-z_trained))
+
+                st.metric(
+                    label="Trained model – approval probability",
+                    value=f"{prob_trained*100:.1f}%",
+                )
+
+                contrib_trained = coef * x_vec
+                contrib_df = pd.DataFrame(
+                    {
+                        "feature": feature_names,
+                        "value": x_vec,
+                        "coefficient": coef,
+                        "contribution": contrib_trained,
+                        "abs_contribution": np.abs(contrib_trained),
+                    }
+                ).sort_values("abs_contribution", ascending=False)
+
+                st.markdown("#### Trained model – top drivers")
+                st.dataframe(
+                    contrib_df.head(10)[
+                        ["feature", "value", "coefficient", "contribution"]
+                    ]
+                )
+
+                with st.expander("Show all trained contributions"):
+                    st.dataframe(
+                        contrib_df[
+                            ["feature", "value", "coefficient", "contribution"]
+                        ]
+                    )
+
                 st.caption(
-                    "Each row shows a variable, its coefficient, its current value for this case, "
-                    "and its contribution to the linear score Z_total (β × X)."
+                    "The trained model currently uses only document-based features "
+                    "(X1–X10 and the Spin Index). As we expand the repository, we can "
+                    "extend this to include context variables as well."
                 )
             else:
-                st.info("No contribution table available from Engine 3 yet.")
-
+                st.info("No trained model found yet – train one in the Repository tab.")
 
 # =========================================================
-# # =========================================================
-# TAB 4 – REPOSITORY / BATCH (STEP 2+3: Case Bundle + Outcomes)
+# TAB 4 – REPOSITORY / BATCH (Case bundles + Outcomes + Training)
 # =========================================================
 with tab_repo:
-    st.header("Repository / Batch – Case Bundle Processing")
+    st.header("Repository / Batch – Case Bundles, Outcomes & Training")
 
     st.markdown(
         """
         ### Purpose  
-        Upload **multiple PDFs** for multiple cases, automatically match  
-        **PS / CR / AP documents** by CaseID, and extract Engine 0 & 1 features  
-        for each case.  
-        
-        Then edit **Outcomes (Approved / Refused)** for regression training (STEP 3).
+        - Upload **multiple PDFs** for multiple cases  
+        - Automatically match **PS / CR / AP** by CaseID  
+        - Run Engine 0 & 1 to generate case-level features  
+        - Edit **Outcomes (Approved / Refused)**  
+        - Train a first-pass logistic regression model from the repository  
 
         ### File naming rule  
         `{CaseID}_PS.pdf`  
@@ -347,9 +395,7 @@ with tab_repo:
         `{CaseID}_AP.pdf`
 
         Example:  
-        `Case001_PS.pdf`  
-        `Case001_CR.pdf`  
-        `Case001_AP.pdf`
+        `Case001_PS.pdf`, `Case001_CR.pdf`, `Case001_AP.pdf`
         """
     )
 
@@ -375,7 +421,7 @@ with tab_repo:
         st.success("Repository cleared.")
 
     # -------------------------
-    # A. Case bundle processing (STEP 2)
+    # A. Case bundle processing
     # -------------------------
     if run_case_bundle:
         import re
@@ -417,19 +463,20 @@ with tab_repo:
 
                 all_rows.append(X)
 
-            df_new = pd.DataFrame(all_rows)
-            if st.session_state["repo_df"] is not None:
-                st.session_state["repo_df"] = pd.concat(
-                    [st.session_state["repo_df"], df_new],
-                    ignore_index=True,
-                ).drop_duplicates(subset=["CaseID"], keep="last")
-            else:
-                st.session_state["repo_df"] = df_new
+            if all_rows:
+                df_new = pd.DataFrame(all_rows)
+                if st.session_state["repo_df"] is not None:
+                    st.session_state["repo_df"] = pd.concat(
+                        [st.session_state["repo_df"], df_new],
+                        ignore_index=True,
+                    ).drop_duplicates(subset=["CaseID"], keep="last")
+                else:
+                    st.session_state["repo_df"] = df_new
 
-            st.success("Repository updated with case bundle results.")
+                st.success("Repository updated with case bundle results.")
 
     # -------------------------
-    # B. Outcome editing (STEP 3)
+    # B. Outcome editing + training
     # -------------------------
     repo_df = st.session_state.get("repo_df", None)
 
@@ -450,13 +497,20 @@ with tab_repo:
             use_container_width=True,
         )
 
-        if st.button("Save edited outcomes"):
-            st.session_state["repo_df"] = edited_df
-            st.success("Repository updated with edited outcomes.")
+        col_save, col_train = st.columns([1, 1])
+
+        with col_save:
+            if st.button("Save edited outcomes"):
+                st.session_state["repo_df"] = edited_df
+                st.success("Repository updated with edited outcomes.")
+
+        with col_train:
+            train_btn = st.button("Train regression model from repository")
 
         st.markdown("### Repository Preview")
         st.dataframe(edited_df)
 
+        # CSV download
         if download_repo2:
             st.download_button(
                 "Download Repository CSV",
@@ -465,6 +519,57 @@ with tab_repo:
                 mime="text/csv",
             )
 
-    else:
-        st.info("No repository entries yet.")
+        # --- Train logistic regression (document features) ---
+        if train_btn:
+            df_train = edited_df.dropna(subset=["Outcome_Binary"]).copy()
 
+            if df_train.empty or df_train["Outcome_Binary"].nunique() < 2:
+                st.error("Need at least two outcome classes (0 and 1) to train the model.")
+            else:
+                feature_cols = [
+                    "X1_Heritage_Harm",
+                    "X2_Design_Quality",
+                    "X3_Amenity_Harm",
+                    "X4_Ecology_Harm",
+                    "X5_GB_Harm",
+                    "X6_Flood_Risk",
+                    "X7_Economic_Benefit",
+                    "X8_Social_Benefit",
+                    "X9_Policy_Compliance",
+                    "X10_Spin_Index",
+                ]
+
+                missing = [c for c in feature_cols if c not in df_train.columns]
+                if missing:
+                    st.error(f"Missing feature columns in repository: {missing}")
+                else:
+                    X = df_train[feature_cols].astype(float)
+                    y = df_train["Outcome_Binary"].astype(int)
+
+                    try:
+                        model = LogisticRegression(max_iter=1000)
+                        model.fit(X, y)
+
+                        coef = model.coef_[0]
+                        intercept = float(model.intercept_[0])
+
+                        st.session_state["trained_model"] = {
+                            "feature_names": feature_cols,
+                            "coef": coef.tolist(),
+                            "intercept": intercept,
+                        }
+
+                        coef_df = pd.DataFrame(
+                            {
+                                "feature": feature_cols,
+                                "coefficient": coef,
+                            }
+                        ).sort_values("coefficient", ascending=False)
+
+                        st.success("Trained logistic regression model from repository.")
+                        st.markdown("#### Trained coefficients (document-based features)")
+                        st.dataframe(coef_df)
+                    except Exception as e:
+                        st.error(f"Error training regression model: {e}")
+    else:
+        st.info("No repository entries yet. Upload and process case bundles first.")
