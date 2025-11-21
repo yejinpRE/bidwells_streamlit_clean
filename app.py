@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LinearRegression
 
 from engine1_text import (
     extract_text_from_pdf,
@@ -317,7 +317,7 @@ with tab_engine3:
                         ]
                     )
 
-            # ---- If a trained model exists, show its prediction as well ----
+            # ---- If a trained regression model exists, show its prediction as well ----
             if st.session_state.get("trained_model") is not None:
                 st.markdown("---")
                 st.markdown("### Trained regression result (document-only model)")
@@ -333,12 +333,11 @@ with tab_engine3:
                     x_vec.append(float(X_all.get(name, 0.0)))
                 x_vec = np.array(x_vec)
 
-                z_trained = intercept + np.dot(coef, x_vec)
-                prob_trained = 1.0 / (1.0 + np.exp(-z_trained))
+                y_pred = intercept + np.dot(coef, x_vec)
 
                 st.metric(
-                    label="Trained model – approval probability",
-                    value=f"{prob_trained*100:.1f}%",
+                    label="Trained model – predicted outcome",
+                    value=f"{y_pred:.2f}",
                 )
 
                 contrib_trained = coef * x_vec
@@ -367,7 +366,7 @@ with tab_engine3:
                     )
 
                 st.caption(
-                    "The trained model currently uses only document-based features "
+                    "The trained regression model currently uses only document-based features "
                     "(X1–X10 and the Spin Index). As we expand the repository, we can "
                     "extend this to include context variables as well."
                 )
@@ -485,8 +484,8 @@ with tab_repo:
 
         df_repo = repo_df.copy()
 
-        if "Outcome_Binary" not in df_repo.columns:
-            df_repo["Outcome_Binary"] = None
+        if "Outcome_Continuous" not in df_repo.columns:
+            df_repo["Outcome_Continuous"] = None
         if "Outcome_Text" not in df_repo.columns:
             df_repo["Outcome_Text"] = None
 
@@ -519,12 +518,12 @@ with tab_repo:
                 mime="text/csv",
             )
 
-        # --- Train logistic regression (document features) ---
+        # --- Train linear regression (document features) ---
         if train_btn:
-            df_train = edited_df.dropna(subset=["Outcome_Binary"]).copy()
+            df_train = edited_df.dropna(subset=["Outcome_Continuous"]).copy()
 
-            if df_train.empty or df_train["Outcome_Binary"].nunique() < 2:
-                st.error("Need at least two outcome classes (0 and 1) to train the model.")
+            if df_train.empty:
+                st.error("Need at least one row with a continuous outcome to train the model.")
             else:
                 feature_cols = [
                     "X1_Heritage_Harm",
@@ -544,14 +543,14 @@ with tab_repo:
                     st.error(f"Missing feature columns in repository: {missing}")
                 else:
                     X = df_train[feature_cols].astype(float)
-                    y = df_train["Outcome_Binary"].astype(int)
+                    y = df_train["Outcome_Continuous"].astype(float)
 
                     try:
-                        model = LogisticRegression(max_iter=1000)
+                        model = LinearRegression()
                         model.fit(X, y)
 
-                        coef = model.coef_[0]
-                        intercept = float(model.intercept_[0])
+                        coef = model.coef_
+                        intercept = float(model.intercept_)
 
                         st.session_state["trained_model"] = {
                             "feature_names": feature_cols,
@@ -566,7 +565,7 @@ with tab_repo:
                             }
                         ).sort_values("coefficient", ascending=False)
 
-                        st.success("Trained logistic regression model from repository.")
+                        st.success("Trained linear regression model from repository.")
                         st.markdown("#### Trained coefficients (document-based features)")
                         st.dataframe(coef_df)
                     except Exception as e:
