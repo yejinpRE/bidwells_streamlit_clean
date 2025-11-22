@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import LogisticRegression
 
 from engine1_text import (
     extract_text_from_pdf,
@@ -9,7 +9,11 @@ from engine1_text import (
     base_scores_from_text,  # used in repository tab if needed
 )
 from engine2_context import build_context_features
-from engine3_model import predict_approval_probability
+from engine3_model import (
+    predict_approval_probability,
+    _sigmoid,
+    logistic_from_coeffs,
+)
 
 # ---------------------------------------------------------
 # Page config
@@ -162,7 +166,8 @@ with tab_engine2:
         - Local plan age  
         - Committee attitude  
         - Green Belt flag  
-        - Flood zone level
+        - Flood zone level  
+        - Land type (Brownfield / Greenfield)
         """
     )
 
@@ -210,6 +215,17 @@ with tab_engine2:
             help="0 = None / Zone 1, 2 = Zone 2, 3 = Zone 3",
         )
 
+        land_type = st.selectbox(
+            "Land type (Brownfield / Greenfield)",
+            options=[0, 1],
+            format_func=lambda x: (
+                "Greenfield / undeveloped land"
+                if x == 0
+                else "Brownfield / previously developed land (PDL)"
+            ),
+            help="0 = Greenfield / open land, 1 = Brownfield / previously developed land (PDL)",
+        )
+
         submit_ctx = st.form_submit_button("Save Engine 2 context inputs")
 
     if submit_ctx:
@@ -220,6 +236,7 @@ with tab_engine2:
             committee_attitude=committee_attitude,
             gb_flag=gb_flag,
             floodzone_level=floodzone_level,
+            land_type=land_type,
         )
         st.session_state["ctx_features"] = ctx_features
         st.success("Context inputs saved for this case.")
@@ -241,7 +258,7 @@ with tab_engine3:
         **Purpose**  
         Engine 3 combines:
         - Engine 0 & 1 document variables (X1–X10)  
-        - Engine 2 context variables (X11–X16)  
+        - Engine 2 context variables (X11–X17)  
         - Interaction terms (Z-variables)  
         
         …into a logit-style model to estimate the probability of planning approval and
@@ -306,16 +323,35 @@ with tab_engine3:
                 st.write("Top drivers (rule-based, by |β × X|):")
                 st.dataframe(
                     df_contrib.head(10)[
-                        ["name", "type", "value", "coefficient", "contribution"]
+                        [
+                            "name",
+                            "type",
+                            "value",
+                            "coefficient",
+                            "contribution",
+                            "policy_ref",
+                        ]
                     ]
                 )
 
                 with st.expander("Show all variables and contributions (rule-based)"):
                     st.dataframe(
                         df_contrib[
-                            ["name", "type", "value", "coefficient", "contribution"]
+                            [
+                                "name",
+                                "type",
+                                "value",
+                                "coefficient",
+                                "contribution",
+                                "policy_ref",
+                            ]
                         ]
                     )
+
+                st.caption(
+                    "‘policy_ref’ shows the key NPPF paragraphs linked to each driver, "
+                    "so planners can see exactly which parts of the Framework underpin the model."
+                )
 
             # ---- If a trained regression model exists, show its prediction as well ----
             if st.session_state.get("trained_model") is not None:
@@ -327,47 +363,44 @@ with tab_engine3:
                 coef = np.array(tm.get("coef", []), dtype=float)
                 intercept = float(tm.get("intercept", 0.0))
 
-                # Build feature vector in the same order
-                x_vec = []
-                for name in feature_names:
-                    x_vec.append(float(X_all.get(name, 0.0)))
-                x_vec = np.array(x_vec)
-
-                y_pred = intercept + np.dot(coef, x_vec)
-
-                st.metric(
-                    label="Trained model – predicted outcome",
-                    value=f"{y_pred:.2f}",
+                trained_result = logistic_from_coeffs(
+                    {k: float(v) for k, v in X_all.items()},
+                    feature_names=feature_names,
+                    coef=coef.tolist(),
+                    intercept=intercept,
+                    policy_links=None,  # 원하면 POLICY_LINKS 넘겨도 됨
                 )
 
-                contrib_trained = coef * x_vec
-                contrib_df = pd.DataFrame(
-                    {
-                        "feature": feature_names,
-                        "value": x_vec,
-                        "coefficient": coef,
-                        "contribution": contrib_trained,
-                        "abs_contribution": np.abs(contrib_trained),
-                    }
-                ).sort_values("abs_contribution", ascending=False)
+                y_prob = trained_result["probability"]
+                z_trained = trained_result["linear_score"]
+                contrib_trained_rows = trained_result["contributions"]
+
+                st.metric(
+                    label="Trained model – approval probability",
+                    value=f"{y_prob*100:.1f}%",
+                )
+
+                contrib_df = pd.DataFrame(contrib_trained_rows).sort_values(
+                    "abs_contribution", ascending=False
+                )
 
                 st.markdown("#### Trained model – top drivers")
                 st.dataframe(
                     contrib_df.head(10)[
-                        ["feature", "value", "coefficient", "contribution"]
+                        ["name", "value", "coefficient", "contribution"]
                     ]
                 )
 
                 with st.expander("Show all trained contributions"):
                     st.dataframe(
                         contrib_df[
-                            ["feature", "value", "coefficient", "contribution"]
+                            ["name", "value", "coefficient", "contribution"]
                         ]
                     )
 
                 st.caption(
-                    "The trained regression model currently uses only document-based features "
-                    "(X1–X10 and the Spin Index). As we expand the repository, we can "
+                    "The trained logistic regression model currently uses only document-based "
+                    "features (X1–X10 and the Spin Index). As we expand the repository, we can "
                     "extend this to include context variables as well."
                 )
             else:
@@ -398,7 +431,6 @@ with tab_repo:
         """
     )
 
-    # Upload multiple PDFs
     batch_files = st.file_uploader(
         "Upload multiple PDFs (PS / CR / AP bundles)",
         type=["pdf"],
@@ -419,9 +451,7 @@ with tab_repo:
         st.session_state["repo_df"] = None
         st.success("Repository cleared.")
 
-    # -------------------------
     # A. Case bundle processing
-    # -------------------------
     if run_case_bundle:
         import re
 
@@ -465,65 +495,49 @@ with tab_repo:
             if all_rows:
                 df_new = pd.DataFrame(all_rows)
                 if st.session_state["repo_df"] is not None:
-                    st.session_state["repo_df"] = pd.concat(
-                        [st.session_state["repo_df"], df_new],
-                        ignore_index=True,
-                    ).drop_duplicates(subset=["CaseID"], keep="last")
+                    st.session_state["repo_df"] = (
+                        pd.concat(
+                            [st.session_state["repo_df"], df_new],
+                            ignore_index=True,
+                        )
+                        .drop_duplicates(subset=["CaseID"], keep="last")
+                    )
                 else:
                     st.session_state["repo_df"] = df_new
 
-                st.success("Repository updated with case bundle results.")
+                st.success("Case bundles processed into repository table.")
 
-    # -------------------------
-    # B. Outcome editing + training
-    # -------------------------
-    repo_df = st.session_state.get("repo_df", None)
+    # Show / edit repository table and outcomes
+    if st.session_state["repo_df"] is not None:
+        st.markdown("### Repository table")
 
-    if repo_df is not None:
-        st.subheader("Edit Outcomes (STEP 3)")
+        df_repo = st.session_state["repo_df"].copy()
+        if "Outcome" not in df_repo.columns:
+            df_repo["Outcome"] = np.nan
 
-        df_repo = repo_df.copy()
-
-        if "Outcome_Continuous" not in df_repo.columns:
-            df_repo["Outcome_Continuous"] = None
-        if "Outcome_Text" not in df_repo.columns:
-            df_repo["Outcome_Text"] = None
+        st.markdown(
+            "Use the **Outcome** column to enter 1 for Approved and 0 for Refused "
+            "(or leave blank if unknown)."
+        )
 
         edited_df = st.data_editor(
             df_repo,
             num_rows="dynamic",
             key="repo_editor",
-            use_container_width=True,
         )
 
-        col_save, col_train = st.columns([1, 1])
+        st.session_state["repo_df"] = edited_df
 
-        with col_save:
-            if st.button("Save edited outcomes"):
-                st.session_state["repo_df"] = edited_df
-                st.success("Repository updated with edited outcomes.")
+        # Training section
+        st.markdown("---")
+        st.markdown("### Train logistic regression model from repository")
 
-        with col_train:
-            train_btn = st.button("Train regression model from repository")
-
-        st.markdown("### Repository Preview")
-        st.dataframe(edited_df)
-
-        # CSV download
-        if download_repo2:
-            st.download_button(
-                "Download Repository CSV",
-                data=edited_df.to_csv(index=False).encode("utf-8"),
-                file_name="case_repository.csv",
-                mime="text/csv",
-            )
-
-        # --- Train linear regression (document features) ---
+        train_btn = st.button("Train logistic regression (document features only)")
         if train_btn:
-            df_train = edited_df.dropna(subset=["Outcome_Continuous"]).copy()
+            df_train = edited_df.dropna(subset=["Outcome"]).copy()
 
             if df_train.empty:
-                st.error("Need at least one row with a continuous outcome to train the model.")
+                st.error("Need at least one row with an Outcome (0/1) to train the model.")
             else:
                 feature_cols = [
                     "X1_Heritage_Harm",
@@ -543,19 +557,20 @@ with tab_repo:
                     st.error(f"Missing feature columns in repository: {missing}")
                 else:
                     X = df_train[feature_cols].astype(float)
-                    y = df_train["Outcome_Continuous"].astype(float)
+                    y = df_train["Outcome"].astype(int)
 
                     try:
-                        model = LinearRegression()
+                        model = LogisticRegression(max_iter=1000)
                         model.fit(X, y)
 
-                        coef = model.coef_
-                        intercept = float(model.intercept_)
+                        coef = model.coef_[0]
+                        intercept = float(model.intercept_[0])
 
                         st.session_state["trained_model"] = {
                             "feature_names": feature_cols,
                             "coef": coef.tolist(),
                             "intercept": intercept,
+                            "model_type": "logistic",
                         }
 
                         coef_df = pd.DataFrame(
@@ -565,10 +580,19 @@ with tab_repo:
                             }
                         ).sort_values("coefficient", ascending=False)
 
-                        st.success("Trained linear regression model from repository.")
+                        st.success("Trained logistic regression model from repository.")
                         st.markdown("#### Trained coefficients (document-based features)")
                         st.dataframe(coef_df)
                     except Exception as e:
-                        st.error(f"Error training regression model: {e}")
+                        st.error(f"Error training logistic regression model: {e}")
+
+        if download_repo2:
+            csv = st.session_state["repo_df"].to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download repository as CSV",
+                data=csv,
+                file_name="plan_checker_repository.csv",
+                mime="text/csv",
+            )
     else:
-        st.info("No repository entries yet. Upload and process case bundles first.")
+        st.info("No repository data yet – upload and process case bundles first.")
